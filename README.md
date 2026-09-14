@@ -75,6 +75,9 @@ requiring a session — see `mutation_rate_limited_routes()` in `lib.rs`.
 | `GET /api/v1/history` | Closed/rolled positions + win/loss/pnl stats (`?limit=`, `?offset=` — stats always cover the full history, not just the returned page) |
 | `GET /api/v1/portfolio/greeks` | Aggregate Greeks across all open positions, repriced live |
 | `POST /api/v1/strategies/execute` | Open 2+ legs atomically under one shared `strategy_id` |
+| `GET /api/v1/strategies` | List multi-leg strategies with aggregate realized/unrealized P&L |
+| `GET /api/v1/strategies/:id` | One strategy's legs + aggregate P&L |
+| `POST /api/v1/strategies/:id/close` | Close every currently-open leg of a strategy atomically |
 
 ### Watchlist & alerts **auth**
 
