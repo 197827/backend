@@ -8,7 +8,7 @@ use crate::auth::AuthUser;
 use crate::collateral::collateral_required;
 use crate::error::{db_error, AppError, AppJson, AppQuery};
 use crate::models::{Account, Position};
-use crate::{black_scholes, smile_vol, AppState, BSInputs};
+use crate::{black_scholes, smile_vol, AppState, BSInputs, BSResult};
 
 pub async fn get_account(
     State(state): State<AppState>,
@@ -275,7 +275,7 @@ pub async fn open_position(
 /// position was opened with rather than tracking real elapsed time
 /// against an absolute expiry timestamp — fine for a paper-trading demo,
 /// but not a real theta decay model.
-async fn close_position_in_tx(
+pub(crate) async fn close_position_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     state: &AppState,
     wallet_address: &str,
@@ -463,9 +463,35 @@ pub struct AggregateGreeks {
     pub vega: f64,
 }
 
-/// Sums each open position's current Greeks (repriced at today's
-/// spot/vol, not the entry-time values stored on the row), flipping sign
-/// for short positions — ported from the frontend's aggregateGreeks().
+/// Reprices a position at today's spot/vol (not the entry-time values
+/// stored on the row). `None` if the underlying has been delisted since
+/// the position was opened — shared by portfolio greeks and strategy
+/// unrealized-P&L, both of which need to skip that case the same way.
+pub(crate) fn current_bs_result(state: &AppState, p: &Position) -> Option<BSResult> {
+    let (spot, base_vol) = {
+        let prices = state.spot_prices.lock().unwrap();
+        let vols = state.vol_surface.lock().unwrap();
+        match (prices.get(&p.underlying), vols.get(&p.underlying)) {
+            (Some(&s), Some(&v)) => (s, v),
+            _ => return None,
+        }
+    };
+
+    let vol = smile_vol(base_vol, p.strike / spot);
+    let t = p.expiry_days / 365.0;
+    let is_call = p.option_type == "call";
+    Some(black_scholes(&BSInputs {
+        spot,
+        strike: p.strike,
+        vol,
+        t,
+        r: 0.05,
+        is_call,
+    }))
+}
+
+/// Sums each open position's current Greeks, flipping sign for short
+/// positions — ported from the frontend's aggregateGreeks().
 pub async fn get_portfolio_greeks(
     State(state): State<AppState>,
     AuthUser(wallet_address): AuthUser,
@@ -479,26 +505,9 @@ pub async fn get_portfolio_greeks(
 
     let mut totals = AggregateGreeks::default();
     for p in &open_positions {
-        let (spot, base_vol) = {
-            let prices = state.spot_prices.lock().unwrap();
-            let vols = state.vol_surface.lock().unwrap();
-            match (prices.get(&p.underlying), vols.get(&p.underlying)) {
-                (Some(&s), Some(&v)) => (s, v),
-                _ => continue, // underlying delisted since this position was opened
-            }
+        let Some(result) = current_bs_result(&state, p) else {
+            continue; // underlying delisted since this position was opened
         };
-
-        let vol = smile_vol(base_vol, p.strike / spot);
-        let t = p.expiry_days / 365.0;
-        let is_call = p.option_type == "call";
-        let result = black_scholes(&BSInputs {
-            spot,
-            strike: p.strike,
-            vol,
-            t,
-            r: 0.05,
-            is_call,
-        });
 
         let sign = if p.position_type == "short" {
             -1.0

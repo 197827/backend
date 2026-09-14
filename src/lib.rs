@@ -600,6 +600,10 @@ fn mutation_rate_limited_routes() -> Router<AppState> {
             "/api/v1/strategies/execute",
             post(strategies::execute_strategy),
         )
+        .route(
+            "/api/v1/strategies/:id/close",
+            post(strategies::close_strategy),
+        )
         .layer(GovernorLayer { config })
 }
 
@@ -637,6 +641,8 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/alerts/:id",
             axum::routing::delete(alerts::delete_alert),
         )
+        .route("/api/v1/strategies", get(strategies::list_strategies))
+        .route("/api/v1/strategies/:id", get(strategies::get_strategy))
         .route("/api/v1/ws/spot", get(prices::ws_spot))
         .route("/api/v1/portfolio/payoff", post(payoff::post_payoff))
         .route(
