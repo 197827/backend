@@ -148,6 +148,47 @@ async fn close_strategy_closes_every_open_leg_atomically() {
 }
 
 #[tokio::test]
+async fn close_strategy_does_not_reclose_a_leg_already_settled_by_a_manual_close() {
+    let app = TestApp::spawn().await;
+    let token = app.login().await;
+    let strategy_id = execute_two_leg_strategy(&app, &token).await;
+
+    let (_, detail) = app
+        .get_with(&format!("/api/v1/strategies/{strategy_id}"), Some(&token))
+        .await;
+    let manually_closed_leg = detail["legs"][0]["id"].as_str().unwrap().to_string();
+
+    let (status, _) = app
+        .post_with(
+            &format!("/api/v1/positions/{manually_closed_leg}/close"),
+            serde_json::Value::Null,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, closed) = app
+        .post_with(
+            &format!("/api/v1/strategies/{strategy_id}/close"),
+            serde_json::Value::Null,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let closed = closed.as_array().unwrap();
+    assert_eq!(
+        closed.len(),
+        1,
+        "only the leg still open should be settled by close_strategy"
+    );
+    assert_ne!(
+        closed[0]["id"].as_str().unwrap(),
+        manually_closed_leg,
+        "the already-closed leg must not be settled a second time"
+    );
+}
+
+#[tokio::test]
 async fn closing_an_already_closed_strategy_404s() {
     let app = TestApp::spawn().await;
     let token = app.login().await;
