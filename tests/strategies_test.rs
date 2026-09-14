@@ -89,6 +89,37 @@ async fn get_strategy_404s_for_an_unknown_id() {
 }
 
 #[tokio::test]
+async fn list_strategies_keeps_status_open_after_a_partial_close() {
+    let app = TestApp::spawn().await;
+    let token = app.login().await;
+    let strategy_id = execute_two_leg_strategy(&app, &token).await;
+
+    let (_, detail) = app
+        .get_with(&format!("/api/v1/strategies/{strategy_id}"), Some(&token))
+        .await;
+    let leg_id = detail["legs"][0]["id"].as_str().unwrap().to_string();
+
+    let (status, _) = app
+        .post_with(
+            &format!("/api/v1/positions/{leg_id}/close"),
+            serde_json::Value::Null,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, strategies) = app.get_with("/api/v1/strategies", Some(&token)).await;
+    let s = &strategies[0];
+    assert_eq!(
+        s["status"].as_str().unwrap(),
+        "open",
+        "one leg still open must keep the whole strategy 'open'"
+    );
+    assert_eq!(s["leg_count"].as_i64().unwrap(), 2);
+    assert_eq!(s["open_leg_count"].as_i64().unwrap(), 1);
+}
+
+#[tokio::test]
 async fn close_strategy_closes_every_open_leg_atomically() {
     let app = TestApp::spawn().await;
     let token = app.login().await;
