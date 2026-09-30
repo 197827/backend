@@ -1,7 +1,10 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Json;
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use sqlx::{Sqlite, Transaction};
 
 use crate::auth::AuthUser;
@@ -90,6 +93,67 @@ pub async fn get_account(
 pub const DEFAULT_LIST_LIMIT: i64 = 50;
 pub const MAX_LIST_LIMIT: i64 = 200;
 
+/// Opaque, HMAC-signed keyset cursor. Encodes the `(sort_key, id)` pair
+/// that the next page should resume after, plus a fingerprint of the
+/// filter set it was minted under so a cursor can't be replayed against a
+/// different query. base64url-encoded so it's safe in a query string.
+#[derive(Serialize, Deserialize)]
+struct CursorPayload {
+    /// `opened_at` of the last row on the previous page.
+    sort_key: String,
+    /// Tiebreaker id of the last row on the previous page.
+    id: String,
+    /// Fingerprint of the filters this cursor was issued for.
+    filters: String,
+}
+
+fn cursor_secret(state: &AppState) -> &[u8] {
+    state.cursor_secret.as_bytes()
+}
+
+fn filters_fingerprint(status: Option<&str>, strategy_id: Option<&str>) -> String {
+    format!(
+        "status={};strategy_id={}",
+        status.unwrap_or(""),
+        strategy_id.unwrap_or("")
+    )
+}
+
+fn encode_cursor(state: &AppState, payload: &CursorPayload) -> Result<String, AppError> {
+    let json = serde_json::to_vec(payload)
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(cursor_secret(state))
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    mac.update(&json);
+    let sig = mac.finalize().into_bytes();
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    Ok(format!(
+        "{}.{}",
+        engine.encode(&json),
+        engine.encode(sig)
+    ))
+}
+
+fn decode_cursor(state: &AppState, token: &str) -> Result<CursorPayload, AppError> {
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (body, sig) = token.split_once('.').ok_or_else(|| {
+        AppError::new(StatusCode::BAD_REQUEST, "malformed cursor")
+    })?;
+    let json = engine
+        .decode(body)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "malformed cursor"))?;
+    let sig = engine
+        .decode(sig)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "malformed cursor"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(cursor_secret(state))
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    mac.update(&json);
+    mac.verify_slice(&sig)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "invalid cursor signature"))?;
+    serde_json::from_slice(&json)
+        .map_err(|_| AppError::new(StatusCode::BAD_REQUEST, "malformed cursor"))
+}
+
 #[derive(Deserialize)]
 pub struct ListPositionsQuery {
     /// "open" | "closed" | "rolled" — omit to return every status.
@@ -99,7 +163,10 @@ pub struct ListPositionsQuery {
     /// Defaults to DEFAULT_LIST_LIMIT, capped at MAX_LIST_LIMIT regardless
     /// of what the caller asks for.
     pub limit: Option<i64>,
+    /// Deprecated offset fallback, kept for one release.
     pub offset: Option<i64>,
+    /// Opaque keyset cursor from a previous page's `next_cursor`.
+    pub cursor: Option<String>,
     /// "current" (default) scopes to the account's current epoch;
     /// "all" includes every prior epoch's history.
     pub epoch: Option<String>,
@@ -120,6 +187,77 @@ pub async fn list_positions(
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .clamp(1, MAX_LIST_LIMIT);
+
+    // Keyset path: resume strictly after the `(opened_at, id)` pair the
+    // cursor encodes. Fetch one extra row to know whether a next page
+    // exists without a COUNT.
+    if let Some(token) = q.cursor.as_deref() {
+        let payload = decode_cursor(&state, token)?;
+        let expected = filters_fingerprint(q.status.as_deref(), q.strategy_id.as_deref());
+        if payload.filters != expected {
+            return Err(AppError::new(
+                StatusCode::BAD_REQUEST,
+                "cursor does not match the current filters",
+            ));
+        }
+
+        let mut rows: Vec<Position> = sqlx::query_as(
+            "SELECT * FROM positions
+                WHERE wallet_address = ?
+                  AND (? IS NULL OR status = ?)
+                  AND (? IS NULL OR strategy_id = ?)
+                  AND (opened_at < ? OR (opened_at = ? AND id < ?))
+             ORDER BY opened_at DESC, id DESC
+             LIMIT ?",
+        )
+        .bind(&wallet_address)
+        .bind(&q.status)
+        .bind(&q.status)
+        .bind(&q.strategy_id)
+        .bind(&q.strategy_id)
+        .bind(&payload.sort_key)
+        .bind(&payload.sort_key)
+        .bind(&payload.id)
+        .bind(limit + 1)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| db_error("list positions", e))?;
+
+        let has_more = rows.len() as i64 > limit;
+        if has_more {
+            rows.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            rows.last().map(|p| {
+                encode_cursor(
+                    &state,
+                    &CursorPayload {
+                        sort_key: p.opened_at.clone(),
+                        id: p.id.clone(),
+                        filters: expected,
+                    },
+                )
+            })
+            .transpose()?
+        } else {
+            None
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-has-more",
+            HeaderValue::from_static(if has_more { "true" } else { "false" }),
+        );
+        if let Some(c) = next_cursor {
+            if let Ok(v) = HeaderValue::from_str(&c) {
+                headers.insert("x-next-cursor", v);
+            }
+        }
+
+        return Ok((headers, Json(rows)));
+    }
+
+    // Deprecated offset fallback (kept for one release).
     let offset = q.offset.unwrap_or(0).max(0);
 
     // `?epoch=all` includes every epoch; anything else (including the
@@ -144,7 +282,7 @@ pub async fn list_positions(
               AND (? IS NULL OR status = ?)
               AND (? IS NULL OR strategy_id = ?)
               AND (? = 1 OR epoch_id IS NULL OR epoch_id = ?)
-         ORDER BY opened_at DESC
+         ORDER BY opened_at DESC, id DESC
          LIMIT ? OFFSET ?",
     )
     .bind(&wallet_address)

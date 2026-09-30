@@ -8,31 +8,19 @@ impl RpcClient {
     }
 
     /// Fetch the account's current sequence number live from the network.
-    pub async fn get_account(&self, account_id: &str) -> R
-    endpoint: String,
-    http: reqwest::Client,
-}
-
-impl RpcClient {
-    /// Create a client for the given RPC endpoint URL.
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            http: reqwest::Client::new(),
-        }
-    }
-
-    /// Fetch the account's current sequence number live from the network.
     pub async fn get_account(&self, account_id: &str) -> Result<AccountInfo, RpcError> {
         let params = json!({ "accountId": account_id });
         let result = self.call("getAccount", params).await?;
 
         let sequence = result
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
-            http: reqwest::Client::new(),
-        }
+            .get("sequence")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::AccountNotFound(account_id.to_string()))?;
+
+        Ok(AccountInfo {
+            account_id: account_id.to_string(),
+            sequence: sequence.to_string(),
+        })
     }
 
     /// Read a batch of ledger entries at a fixed ledger sequence.
@@ -100,22 +88,6 @@ impl RpcClient {
         Ok(GetLedgerEntriesResponse {
             entries: all_entries,
             latest_ledger,
-        })
-    }
-
-    /// Fetch the account's current sequence number live from the network.
-    pub async fn get_account(&self, account_id: &str) -> Result<AccountInfo, RpcError> {
-        let params = json!({ "accountId": account_id });
-        let result = self.call("getAccount", params).await?;
-
-        let sequence = result
-            .get("sequence")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::AccountNotFound(account_id.to_string()))?;
-
-        Ok(AccountInfo {
-            account_id: account_id.to_string(),
-            sequence: sequence.to_string(),
         })
     }
 
@@ -263,6 +235,42 @@ impl RpcClient {
             .await
             .map_err(|e| RpcError::Transport(e.to_string()))?;
 
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(RpcError::RateLimited(self.endpoint.clone()));
+        }
+        if !status.is_success() {
+            return Err(RpcError::Transport(format!("http {status}")));
+        }
+
+        let body: JsonRpcResponse = response
+            .json()
+            .await
+            .map_err(|e| RpcError::Decode(e.to_string()))?;
+
+        if let Some(err) = body.error {
+            return Err(RpcError::JsonRpc {
+                code: err.code,
+                message: err.message,
+            });
+        }
+
+        body.result
+            .ok_or_else(|| RpcError::Decode("missing result in json-rpc response".into()))
+    }
+}
+            .send()
+            .await
+            .map_err(|e| RpcError::Transport(e.to_string()))?;
+
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(RpcError::RateLimited(url.to_string()));
+        }
+        if !status.is_success() {
+            return Err(RpcError::Transport(format!("http {status}")));
+        }
+
         let payload: Value = response
             .json()
             .await
@@ -282,6 +290,44 @@ impl RpcClient {
             .get("result")
             .cloned()
             .ok_or_else(|| RpcError::Unexpected("missing result".into()))
+    }
+
+    /// Execute an idempotent read with retries and endpoint failover.
+    async fn call_read<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<T, RpcError> {
+        let candidates = self.candidates().await;
+        if candidates.is_empty() {
+            return Err(RpcError::NoHealthyEndpoint);
+        }
+
+        let mut last_err: Option<RpcError> = None;
+        for attempt in 0..self.config.max_attempts {
+            let url = candidates[(attempt as usize) % candidates.len()].clone();
+            let started = Instant::now();
+            let outcome = self.call_once::<T>(&url, method, params.clone()).await;
+            let latency = started.elapsed();
+            self.metrics.record(method, latency, outcome.is_err());
+
+            match outcome {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    if matches!(err, RpcError::Transport(_)) {
+                        self.mark_unhealthy(&url).await;
+                    }
+                    let transient = err.is_transient();
+                    last_err = Some(err);
+                    if !transient || attempt + 1 >= self.config.max_attempts {
+                        break;
+                    }
+                    let backoff = self.config.backoff_base * 2u32.pow(attempt);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or(RpcError::NoHealthyEndpoint))
     }
 }
 
@@ -327,5 +373,7 @@ mod tests {
         let err = decode_contract_error("HostError: Error(WasmVm, MissingValue)");
         assert_eq!(err.code, None);
         assert_eq!(err.message, "HostError: Error(WasmVm, MissingValue)");
+    }
+}
     }
 }
