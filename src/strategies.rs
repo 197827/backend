@@ -27,6 +27,12 @@ pub struct ExecuteStrategyRequest {
 /// condor, ...) as one atomic transaction under a shared strategy_id —
 /// either all legs open or none do, so a mid-strategy insufficient-funds
 /// rejection can't leave a naked partial position behind.
+///
+/// Concurrency: the transaction is started with `BEGIN IMMEDIATE` so the
+/// write lock is taken up front. Combined with the atomic conditional
+/// balance updates inside `open_position_in_tx`, two concurrent strategy
+/// opens from the same wallet can no longer both pass the balance check
+/// and overspend — the loser fails fast with 409.
 pub async fn execute_strategy(
     State(state): State<AppState>,
     AuthUser(wallet_address): AuthUser,
@@ -44,7 +50,7 @@ pub async fn execute_strategy(
     let strategy_id = uuid::Uuid::new_v4().to_string();
     let mut tx = state
         .db
-        .begin()
+        .begin_immediate()
         .await
         .map_err(|e| db_error("begin strategy transaction", e))?;
 
@@ -242,18 +248,30 @@ pub async fn get_strategy(
 /// execute_strategy's all-or-nothing open. Legs already closed or rolled
 /// are left as-is; a roll's replacement leg (same strategy_id) still gets
 /// closed normally.
+///
+/// Concurrency: `BEGIN IMMEDIATE` takes the write lock before the open-leg
+/// snapshot is read, and each leg's status transition inside
+/// `close_position_in_tx` is a compare-and-set (`WHERE status = 'open'`),
+/// so two concurrent closes of the same strategy can't double-close a leg
+/// or double-credit collateral — the loser fails fast with 409.
 pub async fn close_strategy(
     State(state): State<AppState>,
     AuthUser(wallet_address): AuthUser,
     Path(strategy_id): Path<String>,
 ) -> Result<Json<Vec<Position>>, AppError> {
+    let mut tx = state
+        .db
+        .begin_immediate()
+        .await
+        .map_err(|e| db_error("begin close-strategy transaction", e))?;
+
     let open_leg_ids: Vec<String> = sqlx::query_scalar(
         "SELECT id FROM positions
             WHERE wallet_address = ? AND strategy_id = ? AND status = 'open'",
     )
     .bind(&wallet_address)
     .bind(&strategy_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| db_error("find open strategy legs", e))?;
 
@@ -263,12 +281,6 @@ pub async fn close_strategy(
             "no open legs in that strategy for this wallet",
         ));
     }
-
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| db_error("begin close-strategy transaction", e))?;
 
     let mut closed = Vec::with_capacity(open_leg_ids.len());
     for id in &open_leg_ids {
